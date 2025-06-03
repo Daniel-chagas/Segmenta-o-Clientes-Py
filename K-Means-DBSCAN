@@ -1,0 +1,190 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Dropout, BatchNormalization
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from tensorflow.keras.callbacks import EarlyStopping
+import statsmodels.api as sm
+
+!pip install yfinance tensorflow matplotlib statsmodels -q
+
+ticker = 'AAPL'
+start_date = '2015-01-01'
+end_date = '2024-05-01'
+
+df = yf.download(ticker, start=start_date, end=end_date)
+
+df.fillna(method='ffill', inplace=True)
+df.fillna(method='bfill', inplace=True)
+
+df['Volume'] = df['Volume']
+df['MA_7'] = df['Close'].rolling(window=7).mean()
+df['MA_30'] = df['Close'].rolling(window=30).mean()
+
+df.dropna(inplace=True)
+
+data = df[['Close', 'Volume', 'MA_7', 'MA_30']].values
+
+scaler = MinMaxScaler(feature_range=(0,1))
+scaled_data = scaler.fit_transform(data)
+
+def create_dataset(dataset, time_step=60, future_steps=5):
+    X, Y = [], []
+    for i in range(len(dataset) - time_step - future_steps + 1):
+        X.append(dataset[i:(i + time_step), :])
+        Y.append(dataset[i + time_step : i + time_step + future_steps, 0])
+    return np.array(X), np.array(Y)
+
+time_step = 60
+future_steps = 5
+X, Y = create_dataset(scaled_data, time_step, future_steps)
+
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+Y_train, Y_test = Y[:train_size], Y[train_size:]
+
+model = Sequential()
+model.add(LSTM(units=100, return_sequences=True, input_shape=(time_step, X_train.shape[2])))
+model.add(BatchNormalization())
+model.add(Dropout(0.3))
+model.add(LSTM(units=100, return_sequences=True))
+model.add(BatchNormalization())
+model.add(Dropout(0.3))
+model.add(LSTM(units=100))
+model.add(BatchNormalization())
+model.add(Dropout(0.3))
+model.add(Dense(future_steps))
+
+model.compile(loss='mean_squared_error', optimizer='adam')
+
+early_stopping = EarlyStopping(patience=10, restore_best_weights=True)
+history = model.fit(X_train, Y_train, epochs=100, batch_size=64, validation_data=(X_test, Y_test), verbose=1, callbacks=[early_stopping])
+
+train_predict = model.predict(X_train)
+test_predict = model.predict(X_test)
+
+close_scaler = MinMaxScaler(feature_range=(0,1))
+close_scaler.fit(df['Close'].values.reshape(-1,1))
+
+train_predict_orig = close_scaler.inverse_transform(train_predict)
+Y_train_orig = close_scaler.inverse_transform(Y_train)
+test_predict_orig = close_scaler.inverse_transform(test_predict)
+Y_test_orig = close_scaler.inverse_transform(Y_test)
+
+mse_train = mean_squared_error(Y_train_orig, train_predict_orig)
+mae_train = mean_absolute_error(Y_train_orig, train_predict_orig)
+r2_train = r2_score(Y_train_orig, train_predict_orig)
+
+mse_test = mean_squared_error(Y_test_orig, test_predict_orig)
+mae_test = mean_absolute_error(Y_test_orig, test_predict_orig)
+r2_test = r2_score(Y_test_orig, test_predict_orig)
+
+print(f'Métricas de Treino:')
+print(f'  MSE: {mse_train:.4f}')
+print(f'  MAE: {mae_train:.4f}')
+print(f'  R²: {r2_train:.4f}')
+
+print(f'\nMétricas de Teste:')
+print(f'  MSE: {mse_test:.4f}')
+print(f'  MAE: {mae_test:.4f}')
+print(f'  R²: {r2_test:.4f}')
+
+train_residuals = Y_train_orig - train_predict_orig
+test_residuals = Y_test_orig - test_predict_orig
+
+plt.figure(figsize=(14, 5))
+plt.scatter(range(len(train_residuals)), train_residuals[:,0], label='Resíduos Treino (1º dia)', alpha=0.5)
+plt.scatter(range(len(test_residuals)), test_residuals[:,0], label='Resíduos Teste (1º dia)', alpha=0.5)
+plt.axhline(0, color='red', linestyle='--')
+plt.title('Resíduos das Previsões (1º dia futuro)')
+plt.xlabel('Amostra')
+plt.ylabel('Erro de Previsão')
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(14,5))
+
+train_data_index = df.index[time_step: time_step + len(train_predict_orig)]
+test_data_index = df.index[time_step + len(train_predict_orig) + future_steps -1 : time_step + len(train_predict_orig) + len(test_predict_orig) + future_steps -1]
+
+plt.plot(train_data_index, Y_train_orig[:, 0], label='Preço real treino')
+plt.plot(train_data_index, train_predict_orig[:, 0], label='Previsão treino (Dia +1)')
+
+plt.plot(test_data_index, Y_test_orig[:, 0], label='Preço real teste')
+plt.plot(test_data_index, test_predict_orig[:, 0], label='Previsão teste (Dia +1)')
+
+
+plt.title(f'Previsão de preços de ações (Dia +1) - {ticker}')
+plt.xlabel('Data')
+plt.ylabel('Preço Fechamento')
+plt.legend()
+plt.show()
+
+last_time_step_data = scaled_data[-time_step:]
+input_seq = last_time_step_data.reshape(1, time_step, X_train.shape[2])
+
+predicted_future_prices_scaled = model.predict(input_seq)
+predicted_future_prices = close_scaler.inverse_transform(predicted_future_prices_scaled)
+
+print(f"\nPreços previstos para os próximos {future_steps} dias:")
+for i in range(future_steps):
+    print(f"  Dia +{i+1}: {predicted_future_prices[0, i]:.2f}")
+
+arima_data = df['Close']
+
+arima_train_size = int(len(arima_data) * 0.8)
+arima_train, arima_test = arima_data[:arima_train_size], arima_data[arima_train_size:]
+
+order = (5, 1, 0)
+model_arima = sm.tsa.arima.ARIMA(arima_train, order=order)
+results_arima = model_arima.fit()
+
+arima_predictions = results_arima.predict(start=len(arima_train), end=len(arima_data)-1)
+
+mse_arima = mean_squared_error(arima_test, arima_predictions)
+mae_arima = mean_absolute_error(arima_test, arima_predictions)
+r2_arima = r2_score(arima_test, arima_predictions)
+
+print(f'\nMétricas do Modelo ARIMA:')
+print(f'  MSE: {mse_arima:.4f}')
+print(f'  MAE: {mae_arima:.4f}')
+print(f'  R²: {r2_arima:.4f}')
+
+plt.figure(figsize=(14, 5))
+plt.plot(arima_train.index, arima_train, label='Preço Real Treino')
+plt.plot(arima_test.index, arima_test, label='Preço Real Teste')
+plt.plot(arima_predictions.index, arima_predictions, color='red', label='Previsões ARIMA')
+plt.title(f'Previsão de preços de ações - {ticker} (ARIMA)')
+plt.xlabel('Data')
+plt.ylabel('Preço Fechamento')
+plt.legend()
+plt.show()
+
+tscv = TimeSeriesSplit(n_splits=5)
+print("\nExemplo de Splits para Cross-Validation Temporal:")
+for train_index, test_index in tscv.split(X):
+    print(f"  Train Indices: {train_index[0]} to {train_index[-1]}, Test Indices: {test_index[0]} to {test_index[-1]}")
+
+plt.figure(figsize=(14, 5))
+plt.plot(test_data_index, Y_test_orig[:, 0], label='Preço real teste')
+
+mean_predictions_fictional = test_predict_orig[:, 0]
+std_predictions_fictional = np.random.rand(len(test_predict_orig)) * 5
+
+plt.plot(test_data_index, mean_predictions_fictional, label='Previsão Média Teste (Dia +1)', color='red')
+plt.fill_between(test_data_index,
+                 mean_predictions_fictional - 1.96 * std_predictions_fictional,
+                 mean_predictions_fictional + 1.96 * std_predictions_fictional,
+                 color='red', alpha=0.2, label='95% Banda de Confiança')
+
+plt.title(f'Previsão de preços com Bandas de Confiança (Dia +1) - {ticker}')
+plt.xlabel('Data')
+plt.ylabel('Preço Fechamento')
+plt.legend()
+plt.show()
+
